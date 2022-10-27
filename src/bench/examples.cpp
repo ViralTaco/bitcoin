@@ -13,9 +13,9 @@ static void Trig(benchmark::Bench& bench)
 {
     double d = 0.01;
     bench.run([&] {
-        sum += sin(d);
+        sum = sum + sin(d);
         d += 0.000001;
     });
 }
 
-BENCHMARK(Trig);
+BENCHMARK(Trig, benchmark::PriorityLevel::HIGH);

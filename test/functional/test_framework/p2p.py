@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # Copyright (c) 2010 ArtForz -- public domain half-a-node
 # Copyright (c) 2012 Jeff Garzik
-# Copyright (c) 2010-2020 The Bitcoin Core developers
+# Copyright (c) 2010-2021 The Bitcoin Core developers
 # Distributed under the MIT software license, see the accompanying
 # file COPYING or http://www.opensource.org/licenses/mit-license.php.
 """Test objects for interacting with a bitcoind node over the p2p protocol.
@@ -47,6 +47,9 @@ from test_framework.messages import (
     msg_getaddr,
     msg_getblocks,
     msg_getblocktxn,
+    msg_getcfcheckpt,
+    msg_getcfheaders,
+    msg_getcfilters,
     msg_getdata,
     msg_getheaders,
     msg_headers,
@@ -59,6 +62,7 @@ from test_framework.messages import (
     msg_sendaddrv2,
     msg_sendcmpct,
     msg_sendheaders,
+    msg_sendtxrcncl,
     msg_tx,
     MSG_TX,
     MSG_TYPE_MASK,
@@ -89,6 +93,8 @@ P2P_SERVICES = NODE_NETWORK | NODE_WITNESS
 P2P_SUBVERSION = "/python-p2p-tester:0.0.3/"
 # Value for relay that this test framework sends in its `version` message
 P2P_VERSION_RELAY = 1
+# Delay after receiving a tx inv before requesting transactions from non-preferred peers, in seconds
+NONPREF_PEER_TX_DELAY = 2
 
 MESSAGEMAP = {
     b"addr": msg_addr,
@@ -106,6 +112,9 @@ MESSAGEMAP = {
     b"getaddr": msg_getaddr,
     b"getblocks": msg_getblocks,
     b"getblocktxn": msg_getblocktxn,
+    b"getcfcheckpt": msg_getcfcheckpt,
+    b"getcfheaders": msg_getcfheaders,
+    b"getcfilters": msg_getcfilters,
     b"getdata": msg_getdata,
     b"getheaders": msg_getheaders,
     b"headers": msg_headers,
@@ -118,6 +127,7 @@ MESSAGEMAP = {
     b"sendaddrv2": msg_sendaddrv2,
     b"sendcmpct": msg_sendcmpct,
     b"sendheaders": msg_sendheaders,
+    b"sendtxrcncl": msg_sendtxrcncl,
     b"tx": msg_tx,
     b"verack": msg_verack,
     b"version": msg_version,
@@ -356,7 +366,7 @@ class P2PInterface(P2PConnection):
 
         return create_conn
 
-    def peer_accept_connection(self, *args, services=NODE_NETWORK | NODE_WITNESS, **kwargs):
+    def peer_accept_connection(self, *args, services=P2P_SERVICES, **kwargs):
         create_conn = super().peer_accept_connection(*args, **kwargs)
         self.peer_connect_send_version(services)
 
@@ -413,6 +423,7 @@ class P2PInterface(P2PConnection):
     def on_sendaddrv2(self, message): pass
     def on_sendcmpct(self, message): pass
     def on_sendheaders(self, message): pass
+    def on_sendtxrcncl(self, message): pass
     def on_tx(self, message): pass
     def on_wtxidrelay(self, message): pass
 
@@ -438,6 +449,8 @@ class P2PInterface(P2PConnection):
             self.send_message(msg_sendaddrv2())
         self.send_message(msg_verack())
         self.nServices = message.nServices
+        self.relay = message.relay
+        self.send_message(msg_getaddr())
 
     # Connection helper methods
 
@@ -576,6 +589,8 @@ class NetworkThread(threading.Thread):
 
         NetworkThread.listeners = {}
         NetworkThread.protos = {}
+        if sys.platform == 'win32':
+            asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
         NetworkThread.network_event_loop = asyncio.new_event_loop()
 
     def run(self):

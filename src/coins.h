@@ -1,5 +1,5 @@
 // Copyright (c) 2009-2010 Satoshi Nakamoto
-// Copyright (c) 2009-2020 The Bitcoin Core developers
+// Copyright (c) 2009-2021 The Bitcoin Core developers
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
@@ -142,7 +142,6 @@ public:
 
     virtual bool GetKey(COutPoint &key) const = 0;
     virtual bool GetValue(Coin &coin) const = 0;
-    virtual unsigned int GetValueSize() const = 0;
 
     virtual bool Valid() const = 0;
     virtual void Next() = 0;
@@ -180,7 +179,7 @@ public:
     virtual bool BatchWrite(CCoinsMap &mapCoins, const uint256 &hashBlock);
 
     //! Get a cursor to iterate over the whole state
-    virtual CCoinsViewCursor *Cursor() const;
+    virtual std::unique_ptr<CCoinsViewCursor> Cursor() const;
 
     //! As we use CCoinsViews polymorphically, have a virtual destructor
     virtual ~CCoinsView() {}
@@ -204,7 +203,7 @@ public:
     std::vector<uint256> GetHeadBlocks() const override;
     void SetBackend(CCoinsView &viewIn);
     bool BatchWrite(CCoinsMap &mapCoins, const uint256 &hashBlock) override;
-    CCoinsViewCursor *Cursor() const override;
+    std::unique_ptr<CCoinsViewCursor> Cursor() const override;
     size_t EstimateSize() const override;
 };
 
@@ -237,7 +236,7 @@ public:
     uint256 GetBestBlock() const override;
     void SetBestBlock(const uint256 &hashBlock);
     bool BatchWrite(CCoinsMap &mapCoins, const uint256 &hashBlock) override;
-    CCoinsViewCursor* Cursor() const override {
+    std::unique_ptr<CCoinsViewCursor> Cursor() const override {
         throw std::logic_error("CCoinsViewCache cursor iteration not supported.");
     }
 

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Copyright (c) 2019-2020 The Bitcoin Core developers
+# Copyright (c) 2019-2021 The Bitcoin Core developers
 # Distributed under the MIT software license, see the accompanying
 # file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
@@ -37,6 +37,7 @@ export USE_BUSY_BOX=${USE_BUSY_BOX:-false}
 
 export RUN_UNIT_TESTS=${RUN_UNIT_TESTS:-true}
 export RUN_FUNCTIONAL_TESTS=${RUN_FUNCTIONAL_TESTS:-true}
+export RUN_TIDY=${RUN_TIDY:-false}
 export RUN_SECURITY_TESTS=${RUN_SECURITY_TESTS:-false}
 # By how much to scale the test_runner timeouts (option --timeout-factor).
 # This is needed because some ci machines have slow CPU or disk, so sanitizers
@@ -47,7 +48,7 @@ export RUN_FUZZ_TESTS=${RUN_FUZZ_TESTS:-false}
 export EXPECTED_TESTS_DURATION_IN_SECONDS=${EXPECTED_TESTS_DURATION_IN_SECONDS:-1000}
 
 export CONTAINER_NAME=${CONTAINER_NAME:-ci_unnamed}
-export DOCKER_NAME_TAG=${DOCKER_NAME_TAG:-ubuntu:18.04}
+export DOCKER_NAME_TAG=${DOCKER_NAME_TAG:-ubuntu:20.04}
 # Randomize test order.
 # See https://www.boost.org/doc/libs/1_71_0/libs/test/doc/html/boost_test/utf_reference/rt_param_reference/random.html
 export BOOST_TEST_RANDOM=${BOOST_TEST_RANDOM:-1}

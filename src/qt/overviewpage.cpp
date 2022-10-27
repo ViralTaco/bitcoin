@@ -1,4 +1,4 @@
-// Copyright (c) 2011-2020 The Bitcoin Core developers
+// Copyright (c) 2011-2021 The Bitcoin Core developers
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
@@ -34,9 +34,8 @@ class TxViewDelegate : public QAbstractItemDelegate
 {
     Q_OBJECT
 public:
-    explicit TxViewDelegate(const PlatformStyle *_platformStyle, QObject *parent=nullptr):
-        QAbstractItemDelegate(parent), unit(BitcoinUnits::BTC),
-        platformStyle(_platformStyle)
+    explicit TxViewDelegate(const PlatformStyle* _platformStyle, QObject* parent = nullptr)
+        : QAbstractItemDelegate(parent), platformStyle(_platformStyle)
     {
         connect(this, &TxViewDelegate::width_changed, this, &TxViewDelegate::sizeHintChanged);
     }
@@ -69,19 +68,17 @@ public:
             foreground = brush.color();
         }
 
+        if (index.data(TransactionTableModel::WatchonlyRole).toBool()) {
+            QIcon iconWatchonly = qvariant_cast<QIcon>(index.data(TransactionTableModel::WatchonlyDecorationRole));
+            QRect watchonlyRect(addressRect.left(), addressRect.top(), 16, addressRect.height());
+            iconWatchonly = platformStyle->TextColorIcon(iconWatchonly);
+            iconWatchonly.paint(painter, watchonlyRect);
+            addressRect.setLeft(addressRect.left() + watchonlyRect.width() + 5);
+        }
+
         painter->setPen(foreground);
         QRect boundingRect;
         painter->drawText(addressRect, Qt::AlignLeft | Qt::AlignVCenter, address, &boundingRect);
-        int address_rect_min_width = boundingRect.width();
-
-        if (index.data(TransactionTableModel::WatchonlyRole).toBool())
-        {
-            QIcon iconWatchonly = qvariant_cast<QIcon>(index.data(TransactionTableModel::WatchonlyDecorationRole));
-            QRect watchonlyRect(boundingRect.right() + 5, mainRect.top()+ypad+halfheight, 16, halfheight);
-            iconWatchonly = platformStyle->TextColorIcon(iconWatchonly);
-            iconWatchonly.paint(painter, watchonlyRect);
-            address_rect_min_width += 5 + watchonlyRect.width();
-        }
 
         if(amount < 0)
         {
@@ -109,7 +106,8 @@ public:
         QRect date_bounding_rect;
         painter->drawText(amountRect, Qt::AlignLeft | Qt::AlignVCenter, GUIUtil::dateTimeStr(date), &date_bounding_rect);
 
-        const int minimum_width = std::max(address_rect_min_width, amount_bounding_rect.width() + date_bounding_rect.width());
+        // 0.4*date_bounding_rect.width() is used to visually distinguish a date from an amount.
+        const int minimum_width = 1.4 * date_bounding_rect.width() + amount_bounding_rect.width();
         const auto search = m_minimum_width.find(index.row());
         if (search == m_minimum_width.end() || search->second != minimum_width) {
             m_minimum_width[index.row()] = minimum_width;
@@ -126,7 +124,7 @@ public:
         return {DECORATION_SIZE + 8 + minimum_text_width, DECORATION_SIZE};
     }
 
-    int unit;
+    BitcoinUnit unit{BitcoinUnit::BTC};
 
 Q_SIGNALS:
     //! An intermediate signal for emitting from the `paint() const` member function.
@@ -148,8 +146,6 @@ OverviewPage::OverviewPage(const PlatformStyle *platformStyle, QWidget *parent) 
     txdelegate(new TxViewDelegate(platformStyle, this))
 {
     ui->setupUi(this);
-
-    m_balances.balance = -1;
 
     // use a SingleColorIcon for the "out of sync warning" icon
     QIcon icon = m_platform_style->SingleColorIcon(QStringLiteral(":/icons/warning"));
@@ -179,8 +175,9 @@ void OverviewPage::handleTransactionClicked(const QModelIndex &index)
 void OverviewPage::setPrivacy(bool privacy)
 {
     m_privacy = privacy;
-    if (m_balances.balance != -1) {
-        setBalance(m_balances);
+    const auto& balances = walletModel->getCachedBalance();
+    if (balances.balance != -1) {
+        setBalance(balances);
     }
 
     ui->listTransactions->setVisible(!m_privacy);
@@ -198,8 +195,7 @@ OverviewPage::~OverviewPage()
 
 void OverviewPage::setBalance(const interfaces::WalletBalances& balances)
 {
-    int unit = walletModel->getOptionsModel()->getDisplayUnit();
-    m_balances = balances;
+    BitcoinUnit unit = walletModel->getOptionsModel()->getDisplayUnit();
     if (walletModel->wallet().isLegacy()) {
         if (walletModel->wallet().privateKeysDisabled()) {
             ui->labelBalance->setText(BitcoinUnits::formatWithPrivacy(unit, balances.watch_only_balance, BitcoinUnits::SeparatorStyle::ALWAYS, m_privacy));
@@ -278,14 +274,13 @@ void OverviewPage::setWalletModel(WalletModel *model)
         ui->listTransactions->setModelColumn(TransactionTableModel::ToAddress);
 
         // Keep up to date with wallet
-        interfaces::Wallet& wallet = model->wallet();
-        interfaces::WalletBalances balances = wallet.getBalances();
-        setBalance(balances);
+        setBalance(model->getCachedBalance());
         connect(model, &WalletModel::balanceChanged, this, &OverviewPage::setBalance);
 
         connect(model->getOptionsModel(), &OptionsModel::displayUnitChanged, this, &OverviewPage::updateDisplayUnit);
 
-        updateWatchOnlyLabels(wallet.haveWatchOnly() && !model->wallet().privateKeysDisabled());
+        interfaces::Wallet& wallet = model->wallet();
+        updateWatchOnlyLabels(wallet.haveWatchOnly() && !wallet.privateKeysDisabled());
         connect(model, &WalletModel::notifyWatchonlyChanged, [this](bool showWatchOnly) {
             updateWatchOnlyLabels(showWatchOnly && !walletModel->wallet().privateKeysDisabled());
         });
@@ -297,21 +292,21 @@ void OverviewPage::setWalletModel(WalletModel *model)
 
 void OverviewPage::changeEvent(QEvent* e)
 {
-#ifdef Q_OS_MACOS
     if (e->type() == QEvent::PaletteChange) {
         QIcon icon = m_platform_style->SingleColorIcon(QStringLiteral(":/icons/warning"));
         ui->labelTransactionsStatus->setIcon(icon);
         ui->labelWalletStatus->setIcon(icon);
     }
-#endif
+
+    QWidget::changeEvent(e);
 }
 
 void OverviewPage::updateDisplayUnit()
 {
-    if(walletModel && walletModel->getOptionsModel())
-    {
-        if (m_balances.balance != -1) {
-            setBalance(m_balances);
+    if (walletModel && walletModel->getOptionsModel()) {
+        const auto& balances = walletModel->getCachedBalance();
+        if (balances.balance != -1) {
+            setBalance(balances);
         }
 
         // Update txdelegate->unit with the current unit

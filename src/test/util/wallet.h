@@ -5,9 +5,12 @@
 #ifndef BITCOIN_TEST_UTIL_WALLET_H
 #define BITCOIN_TEST_UTIL_WALLET_H
 
+#include <outputtype.h>
 #include <string>
 
+namespace wallet {
 class CWallet;
+} // namespace wallet
 
 // Constants //
 
@@ -16,9 +19,11 @@ extern const std::string ADDRESS_BCRT1_UNSPENDABLE;
 // RPC-like //
 
 /** Import the address to the wallet */
-void importaddress(CWallet& wallet, const std::string& address);
-/** Returns a new address from the wallet */
-std::string getnewaddress(CWallet& w);
+void importaddress(wallet::CWallet& wallet, const std::string& address);
+/** Returns a new encoded destination from the wallet (hardcoded to BECH32) */
+std::string getnewaddress(wallet::CWallet& w);
+/** Returns a new destination, of an specific type, from the wallet */
+CTxDestination getNewDestination(wallet::CWallet& w, OutputType output_type);
 
 
 #endif // BITCOIN_TEST_UTIL_WALLET_H

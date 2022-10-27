@@ -58,19 +58,7 @@ void initialize_process_message()
 
     static const auto testing_setup = MakeNoLogFileContext<const TestingSetup>();
     g_setup = testing_setup.get();
-
-    // Temporary debug for https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=35027
-    {
-        LOCK(::cs_main);
-        assert(CheckDiskSpace(gArgs.GetDataDirNet()));
-        assert(CheckDiskSpace(gArgs.GetDataDirNet(), 48 * 2 * 2 * g_setup->m_node.chainman->ActiveChainstate().CoinsTip().GetCacheSize()));
-    }
     for (int i = 0; i < 2 * COINBASE_MATURITY; i++) {
-        {
-            LOCK(::cs_main);
-            assert(CheckDiskSpace(gArgs.GetDataDirNet()));
-            assert(CheckDiskSpace(gArgs.GetDataDirNet(), 48 * 2 * 2 * g_setup->m_node.chainman->ActiveChainstate().CoinsTip().GetCacheSize()));
-        }
         MineBlock(g_setup->m_node, CScript() << OP_TRUE);
     }
     SyncWithValidationInterfaceQueue();
@@ -85,17 +73,16 @@ void fuzz_target(FuzzBufferType buffer, const std::string& LIMIT_TO_MESSAGE_TYPE
     SetMockTime(1610000000); // any time to successfully reset ibd
     chainstate.ResetIbd();
 
+    LOCK(NetEventsInterface::g_msgproc_mutex);
+
     const std::string random_message_type{fuzzed_data_provider.ConsumeBytesAsString(CMessageHeader::COMMAND_SIZE).c_str()};
     if (!LIMIT_TO_MESSAGE_TYPE.empty() && random_message_type != LIMIT_TO_MESSAGE_TYPE) {
         return;
     }
     CNode& p2p_node = *ConsumeNodeAsUniquePtr(fuzzed_data_provider).release();
 
-    const bool successfully_connected{fuzzed_data_provider.ConsumeBool()};
-    p2p_node.fSuccessfullyConnected = successfully_connected;
     connman.AddTestNode(p2p_node);
-    g_setup->m_node.peerman->InitializeNode(&p2p_node);
-    FillNode(fuzzed_data_provider, p2p_node, /* init_version */ successfully_connected);
+    FillNode(fuzzed_data_provider, connman, p2p_node);
 
     const auto mock_time = ConsumeTime(fuzzed_data_provider);
     SetMockTime(mock_time);
@@ -107,10 +94,7 @@ void fuzz_target(FuzzBufferType buffer, const std::string& LIMIT_TO_MESSAGE_TYPE
                                                 GetTime<std::chrono::microseconds>(), std::atomic<bool>{false});
     } catch (const std::ios_base::failure&) {
     }
-    {
-        LOCK(p2p_node.cs_sendProcessing);
-        g_setup->m_node.peerman->SendMessages(&p2p_node);
-    }
+    g_setup->m_node.peerman->SendMessages(&p2p_node);
     SyncWithValidationInterfaceQueue();
     g_setup->m_node.connman->StopNodes();
 }
@@ -146,6 +130,7 @@ FUZZ_TARGET_MSG(pong);
 FUZZ_TARGET_MSG(sendaddrv2);
 FUZZ_TARGET_MSG(sendcmpct);
 FUZZ_TARGET_MSG(sendheaders);
+FUZZ_TARGET_MSG(sendtxrcncl);
 FUZZ_TARGET_MSG(tx);
 FUZZ_TARGET_MSG(verack);
 FUZZ_TARGET_MSG(version);

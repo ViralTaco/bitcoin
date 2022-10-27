@@ -1,4 +1,4 @@
-// Copyright (c) 2009-2020 The Bitcoin Core developers
+// Copyright (c) 2009-2021 The Bitcoin Core developers
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
@@ -31,7 +31,8 @@ enum class NetPermissionFlags : uint32_t {
     NoBan = (1U << 4) | Download,
     // Can query the mempool
     Mempool = (1U << 5),
-    // Can request addrs without hitting a privacy-preserving cache
+    // Can request addrs without hitting a privacy-preserving cache, and send us
+    // unlimited amounts of addrs.
     Addr = (1U << 7),
 
     // True if the user did not specifically set fine grained permissions

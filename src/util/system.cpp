@@ -1,20 +1,18 @@
 // Copyright (c) 2009-2010 Satoshi Nakamoto
-// Copyright (c) 2009-2020 The Bitcoin Core developers
+// Copyright (c) 2009-2021 The Bitcoin Core developers
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
 #include <util/system.h>
 
-#ifdef ENABLE_EXTERNAL_SIGNER
-#include <boost/process.hpp>
-#endif // ENABLE_EXTERNAL_SIGNER
-
 #include <chainparamsbase.h>
+#include <fs.h>
 #include <sync.h>
 #include <util/check.h>
 #include <util/getuniquepath.h>
 #include <util/strencodings.h>
 #include <util/string.h>
+#include <util/syserror.h>
 #include <util/translation.h>
 
 
@@ -44,16 +42,6 @@
 
 #else
 
-#ifdef _MSC_VER
-#pragma warning(disable:4786)
-#pragma warning(disable:4804)
-#pragma warning(disable:4805)
-#pragma warning(disable:4717)
-#endif
-
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
 #include <codecvt>
 
 #include <io.h> /* for _commit */
@@ -65,10 +53,16 @@
 #include <malloc.h>
 #endif
 
-#include <boost/algorithm/string/replace.hpp>
+#include <univalue.h>
+
+#include <fstream>
+#include <map>
+#include <memory>
+#include <optional>
+#include <string>
+#include <system_error>
 #include <thread>
 #include <typeinfo>
-#include <univalue.h>
 
 // Application startup time (used for uptime calculation)
 const int64_t nStartupTime = GetTime();
@@ -79,7 +73,7 @@ const char * const BITCOIN_SETTINGS_FILENAME = "settings.json";
 ArgsManager gArgs;
 
 /** Mutex to protect dir_locks. */
-static Mutex cs_dir_locks;
+static GlobalMutex cs_dir_locks;
 /** A map that contains all the currently held directory locks. After
  * successful locking, these will be held here until the global destructor
  * cleans them up and thus automatically unlocks them, or ReleaseDirectoryLocks
@@ -87,13 +81,13 @@ static Mutex cs_dir_locks;
  */
 static std::map<std::string, std::unique_ptr<fsbridge::FileLock>> dir_locks GUARDED_BY(cs_dir_locks);
 
-bool LockDirectory(const fs::path& directory, const std::string lockfile_name, bool probe_only)
+bool LockDirectory(const fs::path& directory, const fs::path& lockfile_name, bool probe_only)
 {
     LOCK(cs_dir_locks);
     fs::path pathLockFile = directory / lockfile_name;
 
     // If a lock for this directory already exists in the map, don't try to re-lock it
-    if (dir_locks.count(pathLockFile.string())) {
+    if (dir_locks.count(fs::PathToString(pathLockFile))) {
         return true;
     }
 
@@ -102,19 +96,19 @@ bool LockDirectory(const fs::path& directory, const std::string lockfile_name, b
     if (file) fclose(file);
     auto lock = std::make_unique<fsbridge::FileLock>(pathLockFile);
     if (!lock->TryLock()) {
-        return error("Error while attempting to lock directory %s: %s", directory.string(), lock->GetReason());
+        return error("Error while attempting to lock directory %s: %s", fs::PathToString(directory), lock->GetReason());
     }
     if (!probe_only) {
         // Lock successful and we're not just probing, put it into the map
-        dir_locks.emplace(pathLockFile.string(), std::move(lock));
+        dir_locks.emplace(fs::PathToString(pathLockFile), std::move(lock));
     }
     return true;
 }
 
-void UnlockDirectory(const fs::path& directory, const std::string& lockfile_name)
+void UnlockDirectory(const fs::path& directory, const fs::path& lockfile_name)
 {
     LOCK(cs_dir_locks);
-    dir_locks.erase((directory / lockfile_name).string());
+    dir_locks.erase(fs::PathToString(directory / lockfile_name));
 }
 
 void ReleaseDirectoryLocks()
@@ -145,7 +139,7 @@ bool CheckDiskSpace(const fs::path& dir, uint64_t additional_bytes)
 }
 
 std::streampos GetFileSize(const char* path, std::streamsize max) {
-    std::ifstream file(path, std::ios::binary);
+    std::ifstream file{path, std::ios::binary};
     file.ignore(max);
     return file.gcount();
 }
@@ -153,16 +147,14 @@ std::streampos GetFileSize(const char* path, std::streamsize max) {
 /**
  * Interpret a string argument as a boolean.
  *
- * The definition of atoi() requires that non-numeric string values like "foo",
- * return 0. This means that if a user unintentionally supplies a non-integer
- * argument here, the return value is always false. This means that -foo=false
- * does what the user probably expects, but -foo=true is well defined but does
- * not do what they probably expected.
+ * The definition of LocaleIndependentAtoi<int>() requires that non-numeric string values
+ * like "foo", return 0. This means that if a user unintentionally supplies a
+ * non-integer argument here, the return value is always false. This means that
+ * -foo=false does what the user probably expects, but -foo=true is well defined
+ * but does not do what they probably expected.
  *
- * The return value of atoi() is undefined when given input not representable as
- * an int. On most systems this means string value between "-2147483648" and
- * "2147483647" are well defined (this method will return true). Setting
- * -txindex=2147483648 on most systems, however, is probably undefined.
+ * The return value of LocaleIndependentAtoi<int>(...) is zero when given input not
+ * representable as an int.
  *
  * For a more extensive discussion of this topic (and a wide range of opinions
  * on the Right Way to change this code), see PR12713.
@@ -171,7 +163,7 @@ static bool InterpretBool(const std::string& strValue)
 {
     if (strValue.empty())
         return true;
-    return (atoi(strValue) != 0);
+    return (LocaleIndependentAtoi<int>(strValue) != 0);
 }
 
 static std::string SettingName(const std::string& arg)
@@ -179,80 +171,76 @@ static std::string SettingName(const std::string& arg)
     return arg.size() > 0 && arg[0] == '-' ? arg.substr(1) : arg;
 }
 
+struct KeyInfo {
+    std::string name;
+    std::string section;
+    bool negated{false};
+};
+
 /**
- * Interpret -nofoo as if the user supplied -foo=0.
+ * Parse "name", "section.name", "noname", "section.noname" settings keys.
  *
- * This method also tracks when the -no form was supplied, and if so,
- * checks whether there was a double-negative (-nofoo=0 -> -foo=1).
- *
- * If there was not a double negative, it removes the "no" from the key
- * and returns false.
- *
- * If there was a double negative, it removes "no" from the key, and
- * returns true.
- *
- * If there was no "no", it returns the string value untouched.
- *
- * Where an option was negated can be later checked using the
+ * @note Where an option was negated can be later checked using the
  * IsArgNegated() method. One use case for this is to have a way to disable
  * options that are not normally boolean (e.g. using -nodebuglogfile to request
  * that debug log output is not sent to any file at all).
  */
-
-static util::SettingsValue InterpretOption(std::string& section, std::string& key, const std::string& value)
+KeyInfo InterpretKey(std::string key)
 {
+    KeyInfo result;
     // Split section name from key name for keys like "testnet.foo" or "regtest.bar"
     size_t option_index = key.find('.');
     if (option_index != std::string::npos) {
-        section = key.substr(0, option_index);
+        result.section = key.substr(0, option_index);
         key.erase(0, option_index + 1);
     }
     if (key.substr(0, 2) == "no") {
         key.erase(0, 2);
+        result.negated = true;
+    }
+    result.name = key;
+    return result;
+}
+
+/**
+ * Interpret settings value based on registered flags.
+ *
+ * @param[in]   key      key information to know if key was negated
+ * @param[in]   value    string value of setting to be parsed
+ * @param[in]   flags    ArgsManager registered argument flags
+ * @param[out]  error    Error description if settings value is not valid
+ *
+ * @return parsed settings value if it is valid, otherwise nullopt accompanied
+ * by a descriptive error string
+ */
+static std::optional<util::SettingsValue> InterpretValue(const KeyInfo& key, const std::string* value,
+                                                         unsigned int flags, std::string& error)
+{
+    // Return negated settings as false values.
+    if (key.negated) {
+        if (flags & ArgsManager::DISALLOW_NEGATION) {
+            error = strprintf("Negating of -%s is meaningless and therefore forbidden", key.name);
+            return std::nullopt;
+        }
         // Double negatives like -nofoo=0 are supported (but discouraged)
-        if (!InterpretBool(value)) {
-            LogPrintf("Warning: parsed potentially confusing double-negative -%s=%s\n", key, value);
+        if (value && !InterpretBool(*value)) {
+            LogPrintf("Warning: parsed potentially confusing double-negative -%s=%s\n", key.name, *value);
             return true;
         }
         return false;
     }
-    return value;
-}
-
-/**
- * Check settings value validity according to flags.
- *
- * TODO: Add more meaningful error checks here in the future
- * See "here's how the flags are meant to behave" in
- * https://github.com/bitcoin/bitcoin/pull/16097#issuecomment-514627823
- */
-static bool CheckValid(const std::string& key, const util::SettingsValue& val, unsigned int flags, std::string& error)
-{
-    if (val.isBool() && !(flags & ArgsManager::ALLOW_BOOL)) {
-        error = strprintf("Negating of -%s is meaningless and therefore forbidden", key);
-        return false;
+    if (!value && (flags & ArgsManager::DISALLOW_ELISION)) {
+        error = strprintf("Can not set -%s with no value. Please specify value with -%s=value.", key.name, key.name);
+        return std::nullopt;
     }
-    return true;
+    return value ? *value : "";
 }
-
-namespace {
-fs::path StripRedundantLastElementsOfPath(const fs::path& path)
-{
-    auto result = path;
-    while (result.filename().string() == ".") {
-        result = result.parent_path();
-    }
-
-    assert(fs::equivalent(result, path));
-    return result;
-}
-} // namespace
 
 // Define default constructor and destructor that are not inline, so code instantiating this class doesn't need to
 // #include class definitions for all members.
 // For example, m_settings has an internal dependency on univalue.
-ArgsManager::ArgsManager() {}
-ArgsManager::~ArgsManager() {}
+ArgsManager::ArgsManager() = default;
+ArgsManager::~ArgsManager() = default;
 
 const std::set<std::string> ArgsManager::GetUnsuitableSectionOnlyArgs() const
 {
@@ -313,7 +301,7 @@ bool ArgsManager::ParseParameters(int argc, const char* const argv[], std::strin
 #endif
 
         if (key == "-") break; //bitcoin-tx using stdin
-        std::string val;
+        std::optional<std::string> val;
         size_t is_index = key.find('=');
         if (is_index != std::string::npos) {
             val = key.substr(is_index + 1);
@@ -348,21 +336,21 @@ bool ArgsManager::ParseParameters(int argc, const char* const argv[], std::strin
 
         // Transform -foo to foo
         key.erase(0, 1);
-        std::string section;
-        util::SettingsValue value = InterpretOption(section, key, val);
-        std::optional<unsigned int> flags = GetArgFlags('-' + key);
+        KeyInfo keyinfo = InterpretKey(key);
+        std::optional<unsigned int> flags = GetArgFlags('-' + keyinfo.name);
 
         // Unknown command line options and command line options with dot
-        // characters (which are returned from InterpretOption with nonempty
+        // characters (which are returned from InterpretKey with nonempty
         // section strings) are not valid.
-        if (!flags || !section.empty()) {
+        if (!flags || !keyinfo.section.empty()) {
             error = strprintf("Invalid parameter %s", argv[i]);
             return false;
         }
 
-        if (!CheckValid(key, value, *flags, error)) return false;
+        std::optional<util::SettingsValue> value = InterpretValue(keyinfo, val ? &*val : nullptr, *flags, error);
+        if (!value) return false;
 
-        m_settings.command_line_options[key].push_back(value);
+        m_settings.command_line_options[keyinfo.name].push_back(*value);
     }
 
     // we do not allow -includeconf from command line, only -noincludeconf
@@ -389,6 +377,16 @@ std::optional<unsigned int> ArgsManager::GetArgFlags(const std::string& name) co
     return std::nullopt;
 }
 
+fs::path ArgsManager::GetPathArg(std::string arg, const fs::path& default_value) const
+{
+    if (IsArgNegated(arg)) return fs::path{};
+    std::string path_str = GetArg(arg, "");
+    if (path_str.empty()) return default_value;
+    fs::path result = fs::PathFromString(path_str).lexically_normal();
+    // Remove trailing slash, if present.
+    return result.has_filename() ? result : result.parent_path();
+}
+
 const fs::path& ArgsManager::GetBlocksDirPath() const
 {
     LOCK(cs_args);
@@ -399,7 +397,7 @@ const fs::path& ArgsManager::GetBlocksDirPath() const
     if (!path.empty()) return path;
 
     if (IsArgSet("-blocksdir")) {
-        path = fs::system_complete(GetArg("-blocksdir", ""));
+        path = fs::absolute(GetPathArg("-blocksdir"));
         if (!fs::is_directory(path)) {
             path = "";
             return path;
@@ -408,10 +406,9 @@ const fs::path& ArgsManager::GetBlocksDirPath() const
         path = GetDataDirBase();
     }
 
-    path /= BaseParams().DataDir();
+    path /= fs::PathFromString(BaseParams().DataDir());
     path /= "blocks";
     fs::create_directories(path);
-    path = StripRedundantLastElementsOfPath(path);
     return path;
 }
 
@@ -424,9 +421,9 @@ const fs::path& ArgsManager::GetDataDir(bool net_specific) const
     // this function
     if (!path.empty()) return path;
 
-    std::string datadir = GetArg("-datadir", "");
+    const fs::path datadir{GetPathArg("-datadir")};
     if (!datadir.empty()) {
-        path = fs::system_complete(datadir);
+        path = fs::absolute(datadir);
         if (!fs::is_directory(path)) {
             path = "";
             return path;
@@ -434,15 +431,18 @@ const fs::path& ArgsManager::GetDataDir(bool net_specific) const
     } else {
         path = GetDefaultDataDir();
     }
-    if (net_specific)
-        path /= BaseParams().DataDir();
 
-    if (fs::create_directories(path)) {
-        // This is the first run, create wallets subdirectory too
+    if (!fs::exists(path)) {
         fs::create_directories(path / "wallets");
     }
 
-    path = StripRedundantLastElementsOfPath(path);
+    if (net_specific && !BaseParams().DataDir().empty()) {
+        path /= fs::PathFromString(BaseParams().DataDir());
+        if (!fs::exists(path)) {
+            fs::create_directories(path / "wallets");
+        }
+    }
+
     return path;
 }
 
@@ -497,23 +497,26 @@ bool ArgsManager::InitSettings(std::string& error)
 
     std::vector<std::string> errors;
     if (!ReadSettingsFile(&errors)) {
-        error = strprintf("Failed loading settings file:\n- %s\n", Join(errors, "\n- "));
+        error = strprintf("Failed loading settings file:\n%s\n", MakeUnorderedList(errors));
         return false;
     }
     if (!WriteSettingsFile(&errors)) {
-        error = strprintf("Failed saving settings file:\n- %s\n", Join(errors, "\n- "));
+        error = strprintf("Failed saving settings file:\n%s\n", MakeUnorderedList(errors));
         return false;
     }
     return true;
 }
 
-bool ArgsManager::GetSettingsPath(fs::path* filepath, bool temp) const
+bool ArgsManager::GetSettingsPath(fs::path* filepath, bool temp, bool backup) const
 {
-    if (IsArgNegated("-settings")) {
+    fs::path settings = GetPathArg("-settings", BITCOIN_SETTINGS_FILENAME);
+    if (settings.empty()) {
         return false;
     }
+    if (backup) {
+        settings += ".bak";
+    }
     if (filepath) {
-        std::string settings = GetArg("-settings", BITCOIN_SETTINGS_FILENAME);
         *filepath = fsbridge::AbsPathJoin(GetDataDirNet(), temp ? settings + ".tmp" : settings);
     }
     return true;
@@ -545,20 +548,18 @@ bool ArgsManager::ReadSettingsFile(std::vector<std::string>* errors)
         return false;
     }
     for (const auto& setting : m_settings.rw_settings) {
-        std::string section;
-        std::string key = setting.first;
-        (void)InterpretOption(section, key, /* value */ {}); // Split setting key into section and argname
-        if (!GetArgFlags('-' + key)) {
+        KeyInfo key = InterpretKey(setting.first); // Split setting key into section and argname
+        if (!GetArgFlags('-' + key.name)) {
             LogPrintf("Ignoring unknown rw_settings value %s\n", setting.first);
         }
     }
     return true;
 }
 
-bool ArgsManager::WriteSettingsFile(std::vector<std::string>* errors) const
+bool ArgsManager::WriteSettingsFile(std::vector<std::string>* errors, bool backup) const
 {
     fs::path path, path_tmp;
-    if (!GetSettingsPath(&path, /* temp= */ false) || !GetSettingsPath(&path_tmp, /* temp= */ true)) {
+    if (!GetSettingsPath(&path, /*temp=*/false, backup) || !GetSettingsPath(&path_tmp, /*temp=*/true, backup)) {
         throw std::logic_error("Attempt to write settings file when dynamic settings are disabled.");
     }
 
@@ -569,10 +570,17 @@ bool ArgsManager::WriteSettingsFile(std::vector<std::string>* errors) const
         return false;
     }
     if (!RenameOver(path_tmp, path)) {
-        SaveErrors({strprintf("Failed renaming settings file %s to %s\n", path_tmp.string(), path.string())}, errors);
+        SaveErrors({strprintf("Failed renaming settings file %s to %s\n", fs::PathToString(path_tmp), fs::PathToString(path))}, errors);
         return false;
     }
     return true;
+}
+
+util::SettingsValue ArgsManager::GetPersistentSetting(const std::string& name) const
+{
+    LOCK(cs_args);
+    return util::GetSetting(m_settings, m_network, name, !UseDefaultSection("-" + name),
+        /*ignore_nonpersistent=*/true, /*get_chain_name=*/false);
 }
 
 bool ArgsManager::IsArgNegated(const std::string& strArg) const
@@ -582,20 +590,75 @@ bool ArgsManager::IsArgNegated(const std::string& strArg) const
 
 std::string ArgsManager::GetArg(const std::string& strArg, const std::string& strDefault) const
 {
-    const util::SettingsValue value = GetSetting(strArg);
-    return value.isNull() ? strDefault : value.isFalse() ? "0" : value.isTrue() ? "1" : value.get_str();
+    return GetArg(strArg).value_or(strDefault);
 }
 
-int64_t ArgsManager::GetArg(const std::string& strArg, int64_t nDefault) const
+std::optional<std::string> ArgsManager::GetArg(const std::string& strArg) const
 {
     const util::SettingsValue value = GetSetting(strArg);
-    return value.isNull() ? nDefault : value.isFalse() ? 0 : value.isTrue() ? 1 : value.isNum() ? value.get_int64() : atoi64(value.get_str());
+    return SettingToString(value);
+}
+
+std::optional<std::string> SettingToString(const util::SettingsValue& value)
+{
+    if (value.isNull()) return std::nullopt;
+    if (value.isFalse()) return "0";
+    if (value.isTrue()) return "1";
+    if (value.isNum()) return value.getValStr();
+    return value.get_str();
+}
+
+std::string SettingToString(const util::SettingsValue& value, const std::string& strDefault)
+{
+    return SettingToString(value).value_or(strDefault);
+}
+
+int64_t ArgsManager::GetIntArg(const std::string& strArg, int64_t nDefault) const
+{
+    return GetIntArg(strArg).value_or(nDefault);
+}
+
+std::optional<int64_t> ArgsManager::GetIntArg(const std::string& strArg) const
+{
+    const util::SettingsValue value = GetSetting(strArg);
+    return SettingToInt(value);
+}
+
+std::optional<int64_t> SettingToInt(const util::SettingsValue& value)
+{
+    if (value.isNull()) return std::nullopt;
+    if (value.isFalse()) return 0;
+    if (value.isTrue()) return 1;
+    if (value.isNum()) return value.getInt<int64_t>();
+    return LocaleIndependentAtoi<int64_t>(value.get_str());
+}
+
+int64_t SettingToInt(const util::SettingsValue& value, int64_t nDefault)
+{
+    return SettingToInt(value).value_or(nDefault);
 }
 
 bool ArgsManager::GetBoolArg(const std::string& strArg, bool fDefault) const
 {
+    return GetBoolArg(strArg).value_or(fDefault);
+}
+
+std::optional<bool> ArgsManager::GetBoolArg(const std::string& strArg) const
+{
     const util::SettingsValue value = GetSetting(strArg);
-    return value.isNull() ? fDefault : value.isBool() ? value.get_bool() : InterpretBool(value.get_str());
+    return SettingToBool(value);
+}
+
+std::optional<bool> SettingToBool(const util::SettingsValue& value)
+{
+    if (value.isNull()) return std::nullopt;
+    if (value.isBool()) return value.get_bool();
+    return InterpretBool(value.get_str());
+}
+
+bool SettingToBool(const util::SettingsValue& value, bool fDefault)
+{
+    return SettingToBool(value).value_or(fDefault);
 }
 
 bool ArgsManager::SoftSetArg(const std::string& strArg, const std::string& strValue)
@@ -620,14 +683,14 @@ void ArgsManager::ForceSetArg(const std::string& strArg, const std::string& strV
     m_settings.forced_settings[SettingName(strArg)] = strValue;
 }
 
-void ArgsManager::AddCommand(const std::string& cmd, const std::string& help, const OptionsCategory& cat)
+void ArgsManager::AddCommand(const std::string& cmd, const std::string& help)
 {
     Assert(cmd.find('=') == std::string::npos);
     Assert(cmd.at(0) != '-');
 
     LOCK(cs_args);
     m_accept_any_command = false; // latch to false
-    std::map<std::string, Arg>& arg_map = m_available_args[cat];
+    std::map<std::string, Arg>& arg_map = m_available_args[OptionsCategory::COMMANDS];
     auto ret = arg_map.emplace(cmd, Arg{"", help, ArgsManager::COMMAND});
     Assert(ret.second); // Fail on duplicate commands
 }
@@ -664,7 +727,7 @@ std::string ArgsManager::GetHelpMessage() const
 {
     const bool show_debug = GetBoolArg("-help-debug", false);
 
-    std::string usage = "";
+    std::string usage;
     LOCK(cs_args);
     for (const auto& arg_map : m_available_args) {
         switch(arg_map.first) {
@@ -755,7 +818,7 @@ std::string HelpMessageOpt(const std::string &option, const std::string &message
            std::string("\n\n");
 }
 
-static std::string FormatException(const std::exception* pex, const char* pszThread)
+static std::string FormatException(const std::exception* pex, std::string_view thread_name)
 {
 #ifdef WIN32
     char pszModule[MAX_PATH] = "";
@@ -765,15 +828,15 @@ static std::string FormatException(const std::exception* pex, const char* pszThr
 #endif
     if (pex)
         return strprintf(
-            "EXCEPTION: %s       \n%s       \n%s in %s       \n", typeid(*pex).name(), pex->what(), pszModule, pszThread);
+            "EXCEPTION: %s       \n%s       \n%s in %s       \n", typeid(*pex).name(), pex->what(), pszModule, thread_name);
     else
         return strprintf(
-            "UNKNOWN EXCEPTION       \n%s in %s       \n", pszModule, pszThread);
+            "UNKNOWN EXCEPTION       \n%s in %s       \n", pszModule, thread_name);
 }
 
-void PrintExceptionContinue(const std::exception* pex, const char* pszThread)
+void PrintExceptionContinue(const std::exception* pex, std::string_view thread_name)
 {
-    std::string message = FormatException(pex, pszThread);
+    std::string message = FormatException(pex, thread_name);
     LogPrintf("\n\n************************\n%s\n", message);
     tfm::format(std::cerr, "\n\n************************\n%s\n", message);
 }
@@ -805,13 +868,13 @@ fs::path GetDefaultDataDir()
 
 bool CheckDataDirOption()
 {
-    std::string datadir = gArgs.GetArg("-datadir", "");
-    return datadir.empty() || fs::is_directory(fs::system_complete(datadir));
+    const fs::path datadir{gArgs.GetPathArg("-datadir")};
+    return datadir.empty() || fs::is_directory(fs::absolute(datadir));
 }
 
-fs::path GetConfigFile(const std::string& confPath)
+fs::path GetConfigFile(const fs::path& configuration_file_path)
 {
-    return AbsPathForConfigVal(fs::path(confPath), false);
+    return AbsPathForConfigVal(configuration_file_path, /*net_specific=*/false);
 }
 
 static bool GetConfigOptions(std::istream& stream, const std::string& filepath, std::string& error, std::vector<std::pair<std::string, std::string>>& options, std::list<SectionInfo>& sections)
@@ -836,8 +899,8 @@ static bool GetConfigOptions(std::istream& stream, const std::string& filepath, 
                 error = strprintf("parse error on line %i: %s, options in configuration file must be specified without leading -", linenr, str);
                 return false;
             } else if ((pos = str.find('=')) != std::string::npos) {
-                std::string name = prefix + TrimString(str.substr(0, pos), pattern);
-                std::string value = TrimString(str.substr(pos + 1), pattern);
+                std::string name = prefix + TrimString(std::string_view{str}.substr(0, pos), pattern);
+                std::string_view value = TrimStringView(std::string_view{str}.substr(pos + 1), pattern);
                 if (used_hash && name.find("rpcpassword") != std::string::npos) {
                     error = strprintf("parse error on line %i, using # in rpcpassword can be ambiguous and should be avoided", linenr);
                     return false;
@@ -859,6 +922,20 @@ static bool GetConfigOptions(std::istream& stream, const std::string& filepath, 
     return true;
 }
 
+bool IsConfSupported(KeyInfo& key, std::string& error) {
+    if (key.name == "conf") {
+        error = "conf cannot be set in the configuration file; use includeconf= if you want to include additional config files";
+        return false;
+    }
+    if (key.name == "reindex") {
+        // reindex can be set in a config file but it is strongly discouraged as this will cause the node to reindex on
+        // every restart. Allow the config but throw a warning
+        LogPrintf("Warning: reindex=1 is set in the configuration file, which will significantly slow down startup. Consider removing or commenting out this option for better performance, unless there is currently a condition which makes rebuilding the indexes necessary\n");
+        return true;
+    }
+    return true;
+}
+
 bool ArgsManager::ReadConfigStream(std::istream& stream, const std::string& filepath, std::string& error, bool ignore_invalid_keys)
 {
     LOCK(cs_args);
@@ -867,15 +944,15 @@ bool ArgsManager::ReadConfigStream(std::istream& stream, const std::string& file
         return false;
     }
     for (const std::pair<std::string, std::string>& option : options) {
-        std::string section;
-        std::string key = option.first;
-        util::SettingsValue value = InterpretOption(section, key, option.second);
-        std::optional<unsigned int> flags = GetArgFlags('-' + key);
+        KeyInfo key = InterpretKey(option.first);
+        std::optional<unsigned int> flags = GetArgFlags('-' + key.name);
+        if (!IsConfSupported(key, error)) return false;
         if (flags) {
-            if (!CheckValid(key, value, *flags, error)) {
+            std::optional<util::SettingsValue> value = InterpretValue(key, &option.second, *flags, error);
+            if (!value) {
                 return false;
             }
-            m_settings.ro_config[section][key].push_back(value);
+            m_settings.ro_config[key.section][key.name].push_back(*value);
         } else {
             if (ignore_invalid_keys) {
                 LogPrintf("Ignoring unknown configuration value %s\n", option.first);
@@ -896,12 +973,17 @@ bool ArgsManager::ReadConfigFiles(std::string& error, bool ignore_invalid_keys)
         m_config_sections.clear();
     }
 
-    const std::string confPath = GetArg("-conf", BITCOIN_CONF_FILENAME);
-    fsbridge::ifstream stream(GetConfigFile(confPath));
+    const fs::path conf_path = GetPathArg("-conf", BITCOIN_CONF_FILENAME);
+    std::ifstream stream{GetConfigFile(conf_path)};
 
+    // not ok to have a config file specified that cannot be opened
+    if (IsArgSet("-conf") && !stream.good()) {
+        error = strprintf("specified config file \"%s\" could not be opened.", fs::PathToString(conf_path));
+        return false;
+    }
     // ok to not have a config file
     if (stream.good()) {
-        if (!ReadConfigStream(stream, confPath, error, ignore_invalid_keys)) {
+        if (!ReadConfigStream(stream, fs::PathToString(conf_path), error, ignore_invalid_keys)) {
             return false;
         }
         // `-includeconf` cannot be included in the command line arguments except
@@ -939,7 +1021,7 @@ bool ArgsManager::ReadConfigFiles(std::string& error, bool ignore_invalid_keys)
             const size_t default_includes = add_includes({});
 
             for (const std::string& conf_file_name : conf_file_names) {
-                fsbridge::ifstream conf_file_stream(GetConfigFile(conf_file_name));
+                std::ifstream conf_file_stream{GetConfigFile(fs::PathFromString(conf_file_name))};
                 if (conf_file_stream.good()) {
                     if (!ReadConfigStream(conf_file_stream, conf_file_name, error, ignore_invalid_keys)) {
                         return false;
@@ -981,6 +1063,7 @@ std::string ArgsManager::GetChainName() const
         LOCK(cs_args);
         util::SettingsValue value = util::GetSetting(m_settings, /* section= */ "", SettingName(arg),
             /* ignore_default_section_config= */ false,
+            /*ignore_nonpersistent=*/false,
             /* get_chain_name= */ true);
         return value.isNull() ? false : value.isBool() ? value.get_bool() : InterpretBool(value.get_str());
     };
@@ -1013,7 +1096,8 @@ util::SettingsValue ArgsManager::GetSetting(const std::string& arg) const
 {
     LOCK(cs_args);
     return util::GetSetting(
-        m_settings, m_network, SettingName(arg), !UseDefaultSection(arg), /* get_chain_name= */ false);
+        m_settings, m_network, SettingName(arg), !UseDefaultSection(arg),
+        /*ignore_nonpersistent=*/false, /*get_chain_name=*/false);
 }
 
 std::vector<util::SettingsValue> ArgsManager::GetSettingsList(const std::string& arg) const
@@ -1053,17 +1137,24 @@ void ArgsManager::LogArgs() const
 
 bool RenameOver(fs::path src, fs::path dest)
 {
-#ifdef WIN32
+#ifdef __MINGW64__
+    // This is a workaround for a bug in libstdc++ which
+    // implements std::filesystem::rename with _wrename function.
+    // This bug has been fixed in upstream:
+    //  - GCC 10.3: 8dd1c1085587c9f8a21bb5e588dfe1e8cdbba79e
+    //  - GCC 11.1: 1dfd95f0a0ca1d9e6cbc00e6cbfd1fa20a98f312
+    // For more details see the commits mentioned above.
     return MoveFileExW(src.wstring().c_str(), dest.wstring().c_str(),
                        MOVEFILE_REPLACE_EXISTING) != 0;
 #else
-    int rc = std::rename(src.string().c_str(), dest.string().c_str());
-    return (rc == 0);
-#endif /* WIN32 */
+    std::error_code error;
+    fs::rename(src, dest, error);
+    return !error;
+#endif
 }
 
 /**
- * Ignores exceptions thrown by Boost's create_directories if the requested directory exists.
+ * Ignores exceptions thrown by create_directories if the requested directory exists.
  * Specifically handles case where path p exists, but it wasn't possible for the user to
  * write to the parent directory.
  */
@@ -1224,7 +1315,7 @@ fs::path GetSpecialFolderPath(int nFolder, bool fCreate)
 std::string ShellEscape(const std::string& arg)
 {
     std::string escaped = arg;
-    boost::replace_all(escaped, "'", "'\"'\"'");
+    ReplaceAll(escaped, "'", "'\"'\"'");
     return "'" + escaped + "'";
 }
 #endif
@@ -1243,44 +1334,6 @@ void runCommand(const std::string& strCommand)
 }
 #endif
 
-UniValue RunCommandParseJSON(const std::string& str_command, const std::string& str_std_in)
-{
-#ifdef ENABLE_EXTERNAL_SIGNER
-    namespace bp = boost::process;
-
-    UniValue result_json;
-    bp::opstream stdin_stream;
-    bp::ipstream stdout_stream;
-    bp::ipstream stderr_stream;
-
-    if (str_command.empty()) return UniValue::VNULL;
-
-    bp::child c(
-        str_command,
-        bp::std_out > stdout_stream,
-        bp::std_err > stderr_stream,
-        bp::std_in < stdin_stream
-    );
-    if (!str_std_in.empty()) {
-        stdin_stream << str_std_in << std::endl;
-    }
-    stdin_stream.pipe().close();
-
-    std::string result;
-    std::string error;
-    std::getline(stdout_stream, result);
-    std::getline(stderr_stream, error);
-
-    c.wait();
-    const int n_error = c.exit_code();
-    if (n_error) throw std::runtime_error(strprintf("RunCommandParseJSON error: process(%s) returned %d: %s\n", str_command, n_error, error));
-    if (!result_json.read(result)) throw std::runtime_error("Unable to parse JSON: " + result);
-
-    return result_json;
-#else
-    throw std::runtime_error("Compiled without external signing support (required for external signing).");
-#endif // ENABLE_EXTERNAL_SIGNER
-}
 
 void SetupEnvironment()
 {
@@ -1296,7 +1349,7 @@ void SetupEnvironment()
 #endif
     // On most POSIX systems (e.g. Linux, but not BSD) the environment's locale
     // may be invalid, in which case the "C.UTF-8" locale is used as fallback.
-#if !defined(WIN32) && !defined(MAC_OSX) && !defined(__FreeBSD__) && !defined(__OpenBSD__)
+#if !defined(WIN32) && !defined(MAC_OSX) && !defined(__FreeBSD__) && !defined(__OpenBSD__) && !defined(__NetBSD__)
     try {
         std::locale(""); // Raises a runtime error if current locale is invalid
     } catch (const std::runtime_error&) {
@@ -1306,16 +1359,6 @@ void SetupEnvironment()
     // Set the default input/output charset is utf-8
     SetConsoleCP(CP_UTF8);
     SetConsoleOutputCP(CP_UTF8);
-#endif
-    // The path locale is lazy initialized and to avoid deinitialization errors
-    // in multithreading environments, it is set explicitly by the main thread.
-    // A dummy locale is used to extract the internal default locale, used by
-    // fs::path, which is then used to explicitly imbue the path.
-    std::locale loc = fs::path::imbue(std::locale::classic());
-#ifndef WIN32
-    fs::path::imbue(loc);
-#else
-    fs::path::imbue(std::locale(loc, new std::codecvt_utf8_utf16<wchar_t>()));
 #endif
 }
 
@@ -1334,18 +1377,6 @@ bool SetupNetworking()
 int GetNumCores()
 {
     return std::thread::hardware_concurrency();
-}
-
-std::string CopyrightHolders(const std::string& strPrefix)
-{
-    const auto copyright_devs = strprintf(_(COPYRIGHT_HOLDERS).translated, COPYRIGHT_HOLDERS_SUBSTITUTION);
-    std::string strCopyrightHolders = strPrefix + copyright_devs;
-
-    // Make sure Bitcoin Core copyright is not removed by accident
-    if (copyright_devs.find("Bitcoin Core") == std::string::npos) {
-        strCopyrightHolders += "\n" + strPrefix + "The Bitcoin Core developers";
-    }
-    return strCopyrightHolders;
 }
 
 // Obtain the application startup time (used for uptime calculation)
@@ -1368,7 +1399,7 @@ void ScheduleBatchPriority()
     const static sched_param param{};
     const int rc = pthread_setschedparam(pthread_self(), SCHED_BATCH, &param);
     if (rc != 0) {
-        LogPrintf("Failed to pthread_setschedparam: %s\n", strerror(rc));
+        LogPrintf("Failed to pthread_setschedparam: %s\n", SysErrorString(rc));
     }
 #endif
 }
